@@ -50,6 +50,14 @@ async function fixture(test: (f: any) => Promise<void>, { thisComputer = false }
       config: { cli: fileURLToPath(new URL("./testing/fake-acp-cli.ts", import.meta.url)) },
       environment: { FAKE_ACP_MODELS: "fixture/warm", FAKE_ACP_RPC_APPEND_FILE: rpcPath, FAKE_ACP_DUMP: acpDump },
     };
+    config.instances.customAcpFixture = {
+      driver: "customAcp", displayName: "Custom ACP fixture",
+      config: { cli: fileURLToPath(new URL("./testing/fake-acp-cli.ts", import.meta.url)) },
+      environment: {
+        FAKE_ACP_MODELS: "fixture/warm", FAKE_ACP_RPC_APPEND_FILE: rpcPath, FAKE_ACP_DUMP: acpDump,
+        FAKE_ACP_MODE: "echo-gated", FAKE_ACP_GATE_FILE: release,
+      },
+    };
     writeFileSync(configPath, JSON.stringify(config));
     if (thisComputer) {
       // What the desktop app hands its own server once its driver is running.
@@ -63,7 +71,7 @@ async function fixture(test: (f: any) => Promise<void>, { thisComputer = false }
     // With this computer, started as the desktop app starts its own server, which hears the driver record over its parent port.
     server = spawn(process.execPath, ["--experimental-strip-types",
       ...(thisComputer ? ["--import", pathToFileURL(fileURLToPath(new URL("./testing/desktop-parent.mjs", import.meta.url))).href] : []),
-      fileURLToPath(new URL("./index.ts", import.meta.url))], {
+      process.env.OMB_CREDENTIALS_TEST_SERVER_ENTRY ?? fileURLToPath(new URL("./index.ts", import.meta.url))], {
       cwd: fileURLToPath(new URL("..", import.meta.url)),
       env: {
         ...verificationServerEnvironment({ FAKE_CLAUDE_MODE: "hang", FAKE_CLAUDE_RELEASE: release }, dataDir, Number(new URL(url).port)),
@@ -105,7 +113,12 @@ async function fixture(test: (f: any) => Promise<void>, { thisComputer = false }
     };
     const agents = async (token: string) => (await api("GET", "/api/internal/agents", undefined, token)).status;
     const acpServers = () => (JSON.parse(readFileSync(`${acpDump}.mcp.json`, "utf8")) as Array<{ name: string }>).map((server) => server.name);
-    await test({ dataDir, cli, api, turn, hold, finish, agents, launches: () => jsonl(launchesPath), rpc: () => jsonl(rpcPath), acpServers });
+    const acpToken = () => {
+      const servers = JSON.parse(readFileSync(`${acpDump}.mcp.json`, "utf8"));
+      return servers.find((server: any) => server.name === "agents")?.env
+        .find((entry: any) => entry.name === "OMB_COMMS_TOKEN")?.value;
+    };
+    await test({ dataDir, cli, api, turn, hold, finish, agents, acpToken, launches: () => jsonl(launchesPath), rpc: () => jsonl(rpcPath), acpServers });
   } finally {
     if (server) await waitForExit(server, { signal: "SIGTERM" });
     await session.close();
@@ -200,3 +213,36 @@ itAutoThisComputer("keeps a thread's Claude process and ACP session across turns
     .filter((method: string) => method === "session/new" || method === "session/load");
   expect(established).toEqual(["session/new"]);
 }, { thisComputer: true }), 120_000);
+
+it("remints a custom ACP session's authority on the next turn and refuses its rotated bearer", () => fixture(async (f) => {
+  const { bot } = await f.cli("new-bot", "--name", "Custom ACP credential holder");
+  const thread = bot.activeTaskId;
+  const selected = await f.api("PATCH", `/api/bots/${bot.id}/tasks/${thread}`, {
+    modelSelection: { instanceId: "customAcpFixture", model: "agent-default" }, approvalMode: "full",
+  });
+  expect(selected.status, JSON.stringify(selected.body)).toBe(200);
+  await f.turn(bot, thread, "First question.");
+  const token = f.acpToken();
+  expect(token).toMatch(/^[a-f0-9]{48}$/);
+  expect(await f.agents(token)).toBe(401);
+
+  await f.hold(bot, thread, "Second question.");
+  await expect.poll(() => f.rpc().filter((call: any) => call.method === "session/prompt").length).toBe(2);
+  expect(f.acpToken()).toBe(token);
+  expect(await f.agents(token)).toBe(200);
+  const prompts = f.rpc().filter((call: any) => call.method === "session/prompt");
+  expect(prompts[1].pid).toBe(prompts[0].pid);
+  expect(f.rpc().filter((call: any) => ["session/new", "session/load"].includes(call.method)
+    && call.pid === prompts[0].pid).map((call: any) => call.method)).toEqual(["session/new"]);
+  await f.finish(bot, thread);
+  expect(await f.agents(token)).toBe(401);
+
+  expect((await f.api("PATCH", `/api/bots/${bot.id}/tasks/${thread}`, { approvalMode: "ask" })).status).toBe(200);
+  await f.hold(bot, thread, "Ask first now.");
+  await expect.poll(() => f.acpToken()).not.toBe(token);
+  const rotated = f.acpToken();
+  expect(await f.agents(token)).toBe(401);
+  expect(await f.agents(rotated)).toBe(200);
+  expect((await f.api("POST", `/api/bots/${bot.id}/interrupt`, { threadId: thread })).status).toBe(200);
+  expect(await f.agents(rotated)).toBe(401);
+}), 120_000);
